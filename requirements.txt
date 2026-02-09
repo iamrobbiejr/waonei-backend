@@ -1,0 +1,35 @@
+# Core Dependencies
+ultralytics>=8.0.0  # YOLOv8
+opencv-python>=4.8.0
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.24.0
+pillow>=10.0.0
+
+# Celery for async tasks
+celery>=5.3.0
+redis>=4.5.0  # Celery broker
+
+# Supabase
+supabase>=2.0.0
+
+# API Framework
+fastapi>=0.104.0
+uvicorn>=0.24.0
+python-multipart>=0.0.6  # For file uploads
+
+# Utilities
+requests>=2.31.0
+python-dotenv>=1.0.0
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+
+# Optional but recommended
+# For GPU support (if available)
+# torch-cuda  # Install separately based on your CUDA version
+
+# For video processing (optional)
+# opencv-python-headless>=4.8.0  # Use this instead if no display needed
+
+# For advanced image processing
+scikit-image>=0.21.0
