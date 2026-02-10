@@ -31,6 +31,9 @@ def process_violation(self, report_id: str, file_url: str):
 
     Returns:
         dict: Processing result
+        :param file_url:
+        :param report_id:
+        :param self:
     """
     print(f"🚦 Starting AI analysis for Report #{report_id}...")
     print(f"📸 File URL: {file_url}")

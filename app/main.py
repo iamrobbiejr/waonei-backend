@@ -4,11 +4,12 @@ from typing import Optional
 from datetime import datetime
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Request
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Request, Depends, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from supabase import create_client, Client
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, EmailStr
 from app.loggerConfig import setup_logging
 
 
@@ -20,16 +21,47 @@ logger = setup_logging()
 
 load_dotenv()
 
+tags_metadata = [
+    {
+        "name": "Authentication",
+        "description": "Operations to authenticate users.",
+    },
+    {
+        "name": "Reports",
+        "description": "Manage traffic violation reports.",
+    },
+    {
+        "name": "Admin",
+        "description": "Admin-only operations.",
+    },
+    {
+        "name": "Statistics",
+        "description": "Get global statistics about violations.",
+    },
+    {
+        "name": "Health",
+        "description": "Health check endpoint.",
+    },
+]
+
 app = FastAPI(
     title="WAONEI Traffic Violation Reporter",
     description="Anonymous traffic violation reporting with AI verification",
-    version="2.0.0"
+    version="2.0.0",
+    openapi_tags=tags_metadata,
+    docs_url="/docs",      # Explicitly set
+    redoc_url="/redoc",    # Explicitly set
+    openapi_url="/openapi.json"
 )
 
 # Allow Frontend access
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],  # Vite default port
+    allow_origins=[
+        "http://localhost:5173",
+        "http://localhost:8000", # Add the backend itself
+        "http://127.0.0.1:8000"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -57,6 +89,69 @@ class ReportStatusResponse(BaseModel):
     report: dict
 
 
+class UserLogin(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class UserCreate(BaseModel):
+    email: EmailStr
+    password: str
+    role: str = "user"  # Default role is user, can be overridden by admin
+
+
+class UserResponse(BaseModel):
+    id: str
+    email: str
+    role: str = "user"
+    created_at: str
+
+
+class LoginResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: UserResponse
+
+
+# Security
+security = HTTPBearer()
+
+
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Verify the JWT token and return the user."""
+    token = credentials.credentials
+    try:
+        user = supabase.auth.get_user(token)
+        if not user or not user.user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid authentication credentials",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return user.user
+    except Exception as e:
+        logger.error(f"Authentication failed: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+async def check_admin(user=Depends(get_current_user)):
+    """Check if the current user has admin privileges."""
+    # In a real-world scenario, you might store roles in user_metadata or a separate table.
+    # For this implementation, we'll check the user_metadata for a 'role' field.
+    user_role = user.user_metadata.get('role', 'user') if user.user_metadata else 'user'
+    
+    if user_role != 'admin':
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required"
+        )
+    return user
+
+
 # Helper function to get client IP
 def get_client_ip(request: Request) -> str:
     """Extract client IP address"""
@@ -66,7 +161,7 @@ def get_client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
-@app.get("/")
+@app.get("/", tags=["Health"])
 async def root():
     """API root endpoint"""
     return {
@@ -78,12 +173,84 @@ async def root():
             "get_report": "/report/{report_id}",
             "get_violations": "/violations",
             "get_stats": "/statistics",
-            "health": "/health"
+            "health": "/health",
+            "login": "/auth/login",
+            "create_user": "/admin/users"
         }
     }
 
 
-@app.post("/report", response_model=ReportResponse)
+@app.post("/auth/login", response_model=LoginResponse, tags=["Authentication"])
+async def login(user_data: UserLogin):
+    """
+    Login endpoint to get an access token.
+    """
+    try:
+        auth_response = supabase.auth.sign_in_with_password({
+            "email": user_data.email,
+            "password": user_data.password
+        })
+
+        if not auth_response.user or not auth_response.session:
+             raise HTTPException(status_code=400, detail="Invalid login credentials")
+        
+        user = auth_response.user
+        role = user.user_metadata.get('role', 'user') if user.user_metadata else 'user'
+
+        return LoginResponse(
+            access_token=auth_response.session.access_token,
+            user=UserResponse(
+                id=user.id,
+                email=user.email,
+                role=role,
+                created_at=user.created_at
+            )
+        )
+    except Exception as e:
+        logger.error(f"Login failed for {user_data.email}: {str(e)}")
+        raise HTTPException(status_code=400, detail="Start Login Failed or Invalid credentials")
+
+
+@app.post("/admin/users", response_model=UserResponse, tags=["Admin"])
+async def create_user(
+    new_user: UserCreate, 
+    current_user=Depends(check_admin)
+):
+    """
+    Create a new user (admin only).
+    """
+    try:
+        # Create user using Supabase Admin API (requires service_role key)
+        attributes = {
+            "email": new_user.email,
+            "password": new_user.password,
+            "email_confirm": True,
+            "user_metadata": {"role": new_user.role}
+        }
+        
+        # Use the admin client (supabase variable is init with service role key)
+        user_response = supabase.auth.admin.create_user(attributes)
+        
+        if not user_response: # Check if user is actually created
+             raise HTTPException(status_code=400, detail="Failed to create user")
+        
+        user = user_response.user
+        
+        logger.info(f"Admin {current_user.email} created new user {user.email} with role {new_user.role}")
+        
+        return UserResponse(
+            id=user.id,
+            email=user.email,
+            role=new_user.role,
+            created_at=user.created_at or datetime.utcnow().isoformat()
+        )
+            
+    except Exception as e:
+        logger.error(f"User creation failed: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Failed to create user: {str(e)}")
+
+
+@app.post("/report", response_model=ReportResponse, tags=["Reports"])
 async def create_report(
         request: Request,
         file: UploadFile = File(..., description="Image or video evidence"),
@@ -286,7 +453,7 @@ async def create_report(
         )
 
 
-@app.get("/report/{report_id}", response_model=ReportStatusResponse)
+@app.get("/report/{report_id}", response_model=ReportStatusResponse, tags=["Reports"])
 async def get_report(report_id: str):
     """
     Get the status and details of a specific report
@@ -312,7 +479,7 @@ async def get_report(report_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/violations")
+@app.get("/violations", tags=["Reports"])
 async def get_verified_violations(
         limit: int = 50,
         offset: int = 0,
@@ -359,7 +526,7 @@ async def get_verified_violations(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/statistics")
+@app.get("/statistics", tags=["Statistics"])
 async def get_statistics():
     """
     Get overall violation statistics
@@ -410,7 +577,7 @@ async def get_statistics():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/health")
+@app.get("/health", tags=["Health"])
 async def health_check():
     """Health check endpoint"""
     try:

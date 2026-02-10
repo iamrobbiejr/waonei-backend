@@ -21,8 +21,9 @@ python-multipart>=0.0.6  # For file uploads
 # Utilities
 requests>=2.31.0
 python-dotenv>=1.0.0
-pydantic>=2.0.0
+pydantic[email]>=2.0.0
 pydantic-settings>=2.0.0
+email-validator>=2.0.0
 
 # Optional but recommended
 # For GPU support (if available)
