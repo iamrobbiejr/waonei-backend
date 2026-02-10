@@ -104,7 +104,7 @@ class UserResponse(BaseModel):
     id: str
     email: str
     role: str = "user"
-    created_at: str
+    created_at: datetime
 
 
 class LoginResponse(BaseModel):
