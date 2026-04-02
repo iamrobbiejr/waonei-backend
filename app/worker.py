@@ -38,12 +38,12 @@ celery_app.conf.update(
 celery_app.conf.worker_pool = "solo"
 celery_app.conf.worker_concurrency = 1
 
-# Optional: Task routes for multiple queues
-celery_app.conf.task_routes = {
-    'app.tasks.process_violation': {'queue': 'ai_processing'},
-    'app.tasks.batch_process_violations': {'queue': 'batch_processing'},
-    'app.tasks.reprocess_failed_violations': {'queue': 'maintenance'},
-}
+# Optional: Task routes for multiple queues (Commented out for development so single worker handles all)
+# celery_app.conf.task_routes = {
+#     'app.tasks.process_violation': {'queue': 'ai_processing'},
+#     'app.tasks.batch_process_violations': {'queue': 'batch_processing'},
+#     'app.tasks.reprocess_failed_violations': {'queue': 'maintenance'},
+# }
 
 # Optional: Beat schedule for periodic tasks
 celery_app.conf.beat_schedule = {

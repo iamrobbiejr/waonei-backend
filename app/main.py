@@ -1,7 +1,7 @@
 import os
 import uuid
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Request, Depends, status
@@ -15,6 +15,7 @@ from app.loggerConfig import setup_logging
 
 # Import the task
 from app.worker import celery_app
+from app.tasks import process_violation
 
 # Initialize logger - CALL THE FUNCTION HERE
 logger = setup_logging()
@@ -97,7 +98,7 @@ class UserLogin(BaseModel):
 class UserCreate(BaseModel):
     email: EmailStr
     password: str
-    role: str = "user"  # Default role is user, can be overridden by admin
+    role: str = "user"  # The default role is user, can be overridden by admin
 
 
 class UserResponse(BaseModel):
@@ -172,6 +173,7 @@ async def root():
             "submit_report": "/report",
             "get_report": "/report/{report_id}",
             "get_violations": "/violations",
+            "get_pending_violations": "/pending-violations",
             "get_stats": "/statistics",
             "health": "/health",
             "login": "/auth/login",
@@ -242,7 +244,7 @@ async def create_user(
             id=user.id,
             email=user.email,
             role=new_user.role,
-            created_at=user.created_at or datetime.utcnow().isoformat()
+            created_at=user.created_at or datetime.now(timezone.utc).isoformat()
         )
             
     except Exception as e:
@@ -372,7 +374,7 @@ async def create_report(
             "reporter_user_agent": reporter_user_agent,
             "metadata": {
                 "original_filename": file.filename,
-                "upload_timestamp": datetime.utcnow().isoformat()
+                "upload_timestamp": datetime.now(timezone.utc).isoformat()
             }
         }
 
@@ -401,10 +403,7 @@ async def create_report(
         # 5. Trigger Background Worker for AI Analysis
         logger.info(f"Triggering AI analysis - Report ID: {report_id}")
         try:
-            task = celery_app.send_task(
-                "process_violation",
-                args=[report_id, public_url]
-            )
+            task = process_violation.delay(report_id, public_url)
             logger.info(
                 f"AI analysis task queued - Report ID: {report_id}, "
                 f"Task ID: {task.id}"
@@ -480,21 +479,21 @@ async def get_report(report_id: str):
 
 
 @app.get("/violations", tags=["Reports"])
-async def get_verified_violations(
+async def get_violations(
         limit: int = 50,
         offset: int = 0,
         violation_type: Optional[str] = None,
-        min_confidence: float = 0.60,
-        status: str = "verified"
+        status: str = "verified",
+        min_confidence: float = 0.0
 ):
     """
-    Get list of verified violations
+    Get list of violations by status (verified or no_violation)
 
     - **limit**: Number of results (max 100)
     - **offset**: Pagination offset
     - **violation_type**: Filter by type (no_helmet, red_light, wrong_way, illegal_parking)
-    - **min_confidence**: Minimum confidence score
-    - **status**: Report status (verified, pending_analysis, rejected, failed)
+    - **status**: Filter by status (verified or no_violation, defaults to verified)
+    - **min_confidence**: Minimum confidence score (defaults to 0.0)
     """
     try:
         limit = min(limit, 100)
@@ -523,6 +522,59 @@ async def get_verified_violations(
         }
 
     except Exception as e:
+        logger.error(f"Error fetching verified violations: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/pending-violations", tags=["Reports"])
+async def get_pending_violations(
+        limit: int = 50,
+        offset: int = 0,
+        violation_type: Optional[str] = None,
+        min_confidence: float = 0.0,
+        status: str = "pending_analysis"
+):
+    """
+    Get list of reports not yet verified (pending analysis)
+
+    - **limit**: Number of results (max 100)
+    - **offset**: Pagination offset
+    - **violation_type**: Filter by type
+    - **min_confidence**: Minimum confidence score
+    - **status**: Report status (pending_analysis, rejected, failed)
+    """
+    try:
+        limit = min(limit, 100)
+
+        # Ensure we don't return verified reports here
+        if status == "verified":
+             status = "pending_analysis"
+
+        query = supabase.table("reports") \
+            .select("*") \
+            .eq("status", status) \
+            .gte("confidence_score", min_confidence) \
+            .order("created_at", desc=True) \
+            .range(offset, offset + limit - 1)
+
+        if violation_type and violation_type != "all":
+            query = query.eq("violation_type", violation_type)
+
+        result = query.execute()
+
+        return {
+            "success": True,
+            "count": len(result.data),
+            "violations": result.data,
+            "pagination": {
+                "limit": limit,
+                "offset": offset,
+                "has_more": len(result.data) == limit
+            }
+        }
+
+    except Exception as e:
+        logger.error(f"Error fetching pending violations: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -545,7 +597,7 @@ async def get_statistics():
 
         # Calculate stats
         verified_scores = []
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
 
         for report in all_reports.data:
             # Status counts
@@ -586,7 +638,7 @@ async def health_check():
 
         return {
             "status": "healthy",
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "database": "connected",
             "storage": "connected"
         }
@@ -596,7 +648,7 @@ async def health_check():
             content={
                 "status": "unhealthy",
                 "error": str(e),
-                "timestamp": datetime.utcnow().isoformat()
+                "timestamp": datetime.now(timezone.utc).isoformat()
             }
         )
 

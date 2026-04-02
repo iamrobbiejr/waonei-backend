@@ -171,6 +171,13 @@ curl http://localhost:8000/report/550e8400-e29b-41d4-a716-446655440000
 ```bash
 GET /violations?limit=10&min_confidence=0.7&violation_type=no_helmet
 ```
+Returns only verified reports.
+
+### Get Pending Violations
+```bash
+GET /pending-violations?limit=10&status=pending_analysis
+```
+Returns reports that are not yet verified.
 
 ### Get Statistics
 ```bash

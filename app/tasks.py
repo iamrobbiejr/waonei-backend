@@ -7,7 +7,7 @@ from app.worker import celery_app
 from supabase import create_client, Client
 import os
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # Add a parent directory to a path to import detector
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -42,7 +42,7 @@ def process_violation(self, report_id: str, file_url: str):
         # Update status to processing
         supabase.table("reports").update({
             "status": "processing",
-            "processing_started_at": datetime.utcnow().isoformat()
+            "processing_started_at": datetime.now(timezone.utc).isoformat()
         }).eq("id", report_id).execute()
 
         # Get AI detector instance
@@ -72,7 +72,7 @@ def process_violation(self, report_id: str, file_url: str):
             "violation_type": result.violation_type,
             "confidence_score": float(result.confidence),
             "ai_analysis": result.details,
-            "processing_completed_at": datetime.utcnow().isoformat(),
+            "processing_completed_at": datetime.now(timezone.utc).isoformat(),
         }
 
         # Add a bounding box if available
@@ -82,8 +82,8 @@ def process_violation(self, report_id: str, file_url: str):
         # Calculate processing time
         report_data = supabase.table("reports").select("processing_started_at").eq("id", report_id).single().execute()
         if report_data.data and report_data.data.get('processing_started_at'):
-            start_time = datetime.fromisoformat(report_data.data['processing_started_at'])
-            end_time = datetime.utcnow()
+            start_time = datetime.fromisoformat(report_data.data['processing_started_at'].replace('Z', '+00:00'))
+            end_time = datetime.now(timezone.utc)
             processing_time = (end_time - start_time).total_seconds()
             update_data["processing_time_seconds"] = processing_time
 
@@ -111,7 +111,7 @@ def process_violation(self, report_id: str, file_url: str):
             supabase.table("reports").update({
                 "status": "failed",
                 "error_message": error_msg,
-                "processing_completed_at": datetime.utcnow().isoformat()
+                "processing_completed_at": datetime.now(timezone.utc).isoformat()
             }).eq("id", report_id).execute()
         except Exception as db_error:
             print(f"Failed to update error status in DB: {db_error}")
@@ -196,7 +196,7 @@ def reprocess_failed_violations():
         failed_reports = supabase.table("reports")\
             .select("id, file_url")\
             .eq("status", "failed")\
-            .gte("created_at", (datetime.utcnow() - timedelta(hours=24)).isoformat())\
+            .gte("created_at", (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat())\
             .limit(50)\
             .execute()
 
@@ -229,7 +229,7 @@ def cleanup_old_pending():
 
     try:
         # Find reports pending for more than 24 hours
-        cutoff_time = (datetime.utcnow() - timedelta(hours=24)).isoformat()
+        cutoff_time = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
 
         old_pending = supabase.table("reports")\
             .select("id")\
@@ -245,7 +245,7 @@ def cleanup_old_pending():
                 supabase.table("reports").update({
                     "status": "expired",
                     "error_message": "Report expired - not processed within 24 hours",
-                    "processing_completed_at": datetime.utcnow().isoformat()
+                    "processing_completed_at": datetime.now(timezone.utc).isoformat()
                 }).eq("id", report['id']).execute()
 
             print(f"✅ Marked {count} old pending reports as expired")
@@ -278,7 +278,7 @@ def get_processing_stats():
     """
     try:
         # Get all processed reports (last 7 days)
-        week_ago = (datetime.utcnow() - timedelta(days=7)).isoformat()
+        week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
 
         reports = supabase.table("reports")\
             .select("status, processing_time_seconds, confidence_score, violation_type")\
