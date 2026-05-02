@@ -298,7 +298,7 @@ async def create_report(
         file_size = file.file.tell()
         file.file.seek(0)
 
-        max_size = 20 * 1024 * 1024  # 20MB
+        max_size = 100 * 1024 * 1024  # 100MB
         if file_size > max_size:
             logger.warning(
                 f"File size exceeded - IP: {reporter_ip}, "
