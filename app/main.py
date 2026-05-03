@@ -298,7 +298,7 @@ async def create_report(
         file_size = file.file.tell()
         file.file.seek(0)
 
-        max_size = 100 * 1024 * 1024  # 100MB
+        max_size = 20 * 1024 * 1024  # 20 MB — matches mobile compression target
         if file_size > max_size:
             logger.warning(
                 f"File size exceeded - IP: {reporter_ip}, "
@@ -306,7 +306,7 @@ async def create_report(
             )
             raise HTTPException(
                 status_code=400,
-                detail=f"File too large. Maximum size: 20MB"
+                detail="File too large. Maximum size: 20MB. Please compress or shorten your video."
             )
 
         logger.info(f"File validation passed - Size: {file_size / (1024 * 1024):.2f}MB")

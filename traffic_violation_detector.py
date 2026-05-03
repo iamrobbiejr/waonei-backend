@@ -15,6 +15,8 @@ from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 from datetime import datetime
 import requests
+import tempfile
+import os
 from io import BytesIO
 from PIL import Image
 
@@ -96,11 +98,34 @@ def _is_person_on_vehicle(person_bbox, vehicle_bbox) -> bool:
     return (x_overlap * y_overlap) > 0
 
 
+# Video file extensions and MIME types
+VIDEO_EXTENSIONS = {'.mp4', '.mov', '.avi', '.webm', '.mkv', '.3gp', '.m4v'}
+VIDEO_MIME_TYPES = {'video/mp4', 'video/quicktime', 'video/x-msvideo', 'video/webm', 'video/x-matroska'}
+
+
+def _is_video_url(url: str, content_type: str = '') -> bool:
+    """Determine if a URL points to a video file."""
+    ext = os.path.splitext(url.split('?')[0].lower())[1]  # Strip query params first
+    if ext in VIDEO_EXTENSIONS:
+        return True
+    if content_type and any(vt in content_type.lower() for vt in ['video/', 'application/octet-stream']):
+        # Double-check with extension when content-type is ambiguous
+        return ext in VIDEO_EXTENSIONS
+    return False
+
+
 def download_image(url: str) -> np.ndarray:
-    """Download image from URL and convert to OpenCV format"""
+    """Download image from URL and convert to OpenCV format."""
     try:
-        response = requests.get(url, timeout=10)
+        response = requests.get(url, timeout=30)
         response.raise_for_status()
+
+        content_type = response.headers.get('Content-Type', '')
+        if _is_video_url(url, content_type):
+            raise ValueError(
+                f"URL points to a video file. Use extract_frames_from_video() instead. "
+                f"Content-Type: {content_type}"
+            )
 
         image = Image.open(BytesIO(response.content))
         image = image.convert('RGB')
@@ -111,6 +136,103 @@ def download_image(url: str) -> np.ndarray:
 
     except Exception as e:
         raise Exception(f"Failed to download image: {str(e)}")
+
+
+def extract_frames_from_video(url: str, num_frames: int = 5) -> List[np.ndarray]:
+    """
+    Download a video from URL and extract evenly-spaced representative frames.
+
+    Args:
+        url: Public URL to the video file.
+        num_frames: How many frames to sample across the video duration.
+
+    Returns:
+        List of OpenCV frames (numpy arrays in BGR format).
+
+    Raises:
+        Exception: If download or frame extraction fails.
+    """
+    try:
+        print(f"📥 Downloading video for frame extraction: {url}")
+        response = requests.get(url, timeout=60, stream=True)
+        response.raise_for_status()
+
+        # Write to a temporary file because OpenCV VideoCapture needs a file path
+        suffix = os.path.splitext(url.split('?')[0])[1] or '.mp4'
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp_path = tmp.name
+            for chunk in response.iter_content(chunk_size=8192):
+                tmp.write(chunk)
+
+        try:
+            cap = cv2.VideoCapture(tmp_path)
+            if not cap.isOpened():
+                raise ValueError(f"OpenCV could not open video file at {tmp_path}")
+
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30
+            duration_sec = total_frames / fps if total_frames > 0 else 0
+
+            print(f"🎬 Video info: {total_frames} frames, {fps:.1f} fps, {duration_sec:.1f}s")
+
+            if total_frames == 0:
+                # Fallback: just grab the first available frame
+                ret, frame = cap.read()
+                cap.release()
+                if ret and frame is not None:
+                    return [frame]
+                raise ValueError("Video has no readable frames.")
+
+            # Sample evenly across the video, avoid the very first/last 5% to skip
+            # logos or black intro/outro frames
+            start = max(0, int(total_frames * 0.05))
+            end = min(total_frames - 1, int(total_frames * 0.95))
+            indices = [
+                int(start + i * (end - start) / max(num_frames - 1, 1))
+                for i in range(num_frames)
+            ]
+
+            frames = []
+            for idx in indices:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                ret, frame = cap.read()
+                if ret and frame is not None:
+                    frames.append(frame)
+
+            cap.release()
+
+            if not frames:
+                raise ValueError("No frames could be extracted from the video.")
+
+            print(f"✅ Extracted {len(frames)} frames from video.")
+            return frames
+
+        finally:
+            # Always clean up the temp file
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    except Exception as e:
+        raise Exception(f"Failed to extract frames from video: {str(e)}")
+
+
+def load_media(url: str) -> tuple:
+    """
+    Smart media loader: returns (frames, is_video).
+    For images, frames = [single_frame].
+    For videos, frames = [multiple sampled frames].
+    """
+    response_head = requests.head(url, timeout=10, allow_redirects=True)
+    content_type = response_head.headers.get('Content-Type', '')
+
+    if _is_video_url(url, content_type):
+        frames = extract_frames_from_video(url, num_frames=5)
+        return frames, True
+    else:
+        frame = download_image(url)
+        return [frame], False
 
 
 class TrafficViolationDetector:
@@ -371,27 +493,8 @@ class TrafficViolationDetector:
 
         return None
 
-    def analyze_image(self, image_source: str) -> ViolationResult:
-        """
-        Main analysis function - checks for all violation types
-
-        Args:
-            image_source: URL or file path to image
-
-        Returns:
-            ViolationResult with the highest confidence violation found
-        """
-        # Download/load image
-        if image_source.startswith('http'):
-            image = download_image(image_source)
-        else:
-            image = cv2.imread(image_source)
-            if image is None:
-                raise ValueError(f"Could not read image from {image_source}")
-
-        print(f"Image loaded: {image.shape}")
-
-        # Run all detection methods
+    def _analyze_single_frame(self, image: np.ndarray) -> List[ViolationResult]:
+        """Run all detectors on a single frame and return all violations found."""
         violations_found = []
 
         # 1. No Helmet
@@ -414,16 +517,75 @@ class TrafficViolationDetector:
         if parking_result:
             violations_found.append(parking_result)
 
-        # Return highest confidence violation or no violation found
-        if violations_found:
-            best_violation = max(violations_found, key=lambda x: x.confidence)
+        return violations_found
+
+    def analyze_image(self, image_source: str) -> ViolationResult:
+        """
+        Main analysis function - handles both images and videos.
+
+        For images: performs detection on the single frame.
+        For videos: samples multiple frames and returns the highest-confidence
+                    violation found across all frames.
+
+        Args:
+            image_source: URL or file path to image/video.
+
+        Returns:
+            ViolationResult with the highest confidence violation found.
+        """
+        if image_source.startswith('http'):
+            frames, is_video = load_media(image_source)
+        else:
+            # Local file path — detect by extension
+            ext = os.path.splitext(image_source.lower())[1]
+            if ext in VIDEO_EXTENSIONS:
+                cap = cv2.VideoCapture(image_source)
+                if not cap.isOpened():
+                    raise ValueError(f"Could not open video from {image_source}")
+                total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                indices = [int(total * i / 4) for i in range(5)]
+                frames = []
+                for idx in indices:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                    ret, frame = cap.read()
+                    if ret and frame is not None:
+                        frames.append(frame)
+                cap.release()
+                is_video = True
+            else:
+                img = cv2.imread(image_source)
+                if img is None:
+                    raise ValueError(f"Could not read image from {image_source}")
+                frames = [img]
+                is_video = False
+
+        media_type = "video" if is_video else "image"
+        print(f"📂 Media type: {media_type}, frames to analyze: {len(frames)}")
+
+        # Analyze each frame and collect all violations
+        all_violations: List[ViolationResult] = []
+        for i, frame in enumerate(frames):
+            print(f"   🔍 Analyzing frame {i + 1}/{len(frames)} — shape: {frame.shape}")
+            frame_violations = self._analyze_single_frame(frame)
+            all_violations.extend(frame_violations)
+
+        # Return highest confidence violation across all frames, or no-violation
+        if all_violations:
+            best_violation = max(all_violations, key=lambda x: x.confidence)
+            if is_video:
+                best_violation.details['source'] = 'video'
+                best_violation.details['frames_analyzed'] = len(frames)
             return best_violation
         else:
             return ViolationResult(
                 violation_type='none',
                 confidence=0.0,
                 status='no_violation',
-                details={'description': 'No traffic violations detected in image'}
+                details={
+                    'description': f'No traffic violations detected in {media_type}',
+                    'source': media_type,
+                    'frames_analyzed': len(frames)
+                }
             )
 
     # Helper methods (simplified for demo)
