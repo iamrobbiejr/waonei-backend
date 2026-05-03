@@ -68,10 +68,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Init Supabase
-supabase: Client = create_client(
+# Init Supabase clients
+supabase_admin: Client = create_client(
     os.getenv("SUPABASE_URL"),
     os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+)
+
+# Keep auth/login client isolated so it cannot override admin headers/session.
+supabase_auth: Client = create_client(
+    os.getenv("SUPABASE_URL"),
+    os.getenv("SUPABASE_ANON_KEY") or os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 )
 
 
@@ -122,7 +128,7 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     """Verify the JWT token and return the user."""
     token = credentials.credentials
     try:
-        user = supabase.auth.get_user(token)
+        user = supabase_admin.auth.get_user(token)
         if not user or not user.user:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -188,7 +194,7 @@ async def login(user_data: UserLogin):
     Login endpoint to get an access token.
     """
     try:
-        auth_response = supabase.auth.sign_in_with_password({
+        auth_response = supabase_auth.auth.sign_in_with_password({
             "email": user_data.email,
             "password": user_data.password
         })
@@ -230,8 +236,8 @@ async def create_user(
             "user_metadata": {"role": new_user.role}
         }
         
-        # Use the admin client (supabase variable is init with service role key)
-        user_response = supabase.auth.admin.create_user(attributes)
+        # Use the admin client initialized with service role key.
+        user_response = supabase_admin.auth.admin.create_user(attributes)
         
         if not user_response: # Check if user is actually created
              raise HTTPException(status_code=400, detail="Failed to create user")
@@ -321,7 +327,7 @@ async def create_report(
         bucket_name = "evidence-uploads"
 
         try:
-            res = supabase.storage.from_(bucket_name).upload(
+            res = supabase_admin.storage.from_(bucket_name).upload(
                 file_name,
                 file_content,
                 file_options={
@@ -338,7 +344,7 @@ async def create_report(
             )
 
         # Get Public URL
-        public_url = supabase.storage.from_(bucket_name).get_public_url(file_name)
+        public_url = supabase_admin.storage.from_(bucket_name).get_public_url(file_name)
         logger.debug(f"Public URL generated: {public_url}")
 
         # 3. Prepare vehicle details JSONB
@@ -379,7 +385,7 @@ async def create_report(
         }
 
         try:
-            db_res = supabase.table("reports").insert(data).execute()
+            db_res = supabase_admin.table("reports").insert(data).execute()
 
             if not db_res.data:
                 logger.error("Database insert returned empty data")
@@ -458,7 +464,7 @@ async def get_report(report_id: str):
     Get the status and details of a specific report
     """
     try:
-        result = supabase.table("reports") \
+        result = supabase_admin.table("reports") \
             .select("*") \
             .eq("id", report_id) \
             .single() \
@@ -498,7 +504,7 @@ async def get_violations(
     try:
         limit = min(limit, 100)
 
-        query = supabase.table("reports") \
+        query = supabase_admin.table("reports") \
             .select("*") \
             .eq("status", status) \
             .gte("confidence_score", min_confidence) \
@@ -550,7 +556,7 @@ async def get_pending_violations(
         if status == "verified":
              status = "pending_analysis"
 
-        query = supabase.table("reports") \
+        query = supabase_admin.table("reports") \
             .select("*") \
             .eq("status", status) \
             .gte("confidence_score", min_confidence) \
@@ -585,7 +591,7 @@ async def get_statistics():
     """
     try:
         # Get counts by violation type
-        all_reports = supabase.table("reports").select("*").execute()
+        all_reports = supabase_admin.table("reports").select("*").execute()
 
         stats = {
             "total_reports": len(all_reports.data),
@@ -634,7 +640,7 @@ async def health_check():
     """Health check endpoint"""
     try:
         # Test database connection
-        supabase.table("reports").select("count").limit(1).execute()
+        supabase_admin.table("reports").select("count").limit(1).execute()
 
         return {
             "status": "healthy",
