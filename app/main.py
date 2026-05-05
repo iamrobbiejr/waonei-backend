@@ -1,13 +1,15 @@
 import os
 import uuid
 from typing import Optional
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Request, Depends, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+import csv
+import io
 from supabase import create_client, Client
 from pydantic import BaseModel, Field, EmailStr
 from app.loggerConfig import setup_logging
@@ -38,6 +40,10 @@ tags_metadata = [
     {
         "name": "Statistics",
         "description": "Get global statistics about violations.",
+    },
+    {
+        "name": "Analytics",
+        "description": "Enterprise-grade reporting and data analysis.",
     },
     {
         "name": "Health",
@@ -632,6 +638,219 @@ async def get_statistics():
         }
 
     except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/analytics/summary", tags=["Analytics"])
+async def get_analytics_summary():
+    """
+    Get detailed analytics summary for enterprise reports
+    """
+    try:
+        # Fetch all reports for aggregation
+        # In a real enterprise app, we'd use database-level grouping/aggregation
+        res = supabase_admin.table("reports").select("*").execute()
+        reports = res.data
+
+        summary = {
+            "total_reports": len(reports),
+            "by_status": {},
+            "by_violation_type": {},
+            "by_priority": {"high": 0, "normal": 0},
+            "avg_confidence": 0,
+            "avg_processing_time": 0,
+            "total_file_size_mb": 0
+        }
+
+        conf_scores = []
+        proc_times = []
+
+        for r in reports:
+            # Status
+            status = r.get("status", "unknown")
+            summary["by_status"][status] = summary["by_status"].get(status, 0) + 1
+
+            # Type
+            v_type = r.get("violation_type", "unknown")
+            summary["by_violation_type"][v_type] = summary["by_violation_type"].get(v_type, 0) + 1
+
+            # Priority
+            priority = r.get("priority", "normal")
+            summary["by_priority"][priority] = summary["by_priority"].get(priority, 0) + 1
+
+            # Confidence
+            if r.get("confidence_score"):
+                conf_scores.append(r["confidence_score"])
+
+            # Processing time
+            if r.get("processing_time_seconds"):
+                proc_times.append(r["processing_time_seconds"])
+
+            # File size
+            if r.get("file_size"):
+                summary["total_file_size_mb"] += r["file_size"] / (1024 * 1024)
+
+        if conf_scores:
+            summary["avg_confidence"] = sum(conf_scores) / len(conf_scores)
+        if proc_times:
+            summary["avg_processing_time"] = sum(proc_times) / len(proc_times)
+
+        return {
+            "success": True,
+            "summary": summary
+        }
+    except Exception as e:
+        logger.error(f"Analytics summary failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/analytics/trends", tags=["Analytics"])
+async def get_analytics_trends(days: int = 30):
+    """
+    Get violation trends over time
+    """
+    try:
+        # Calculate date range
+        cutoff_date = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        
+        res = supabase_admin.table("reports") \
+            .select("created_at, status, violation_type") \
+            .gte("created_at", cutoff_date) \
+            .execute()
+        
+        reports = res.data
+        
+        # Group by date
+        trends = {}
+        for r in reports:
+            # Extract date part only
+            date_str = datetime.fromisoformat(r["created_at"].replace('Z', '+00:00')).strftime("%Y-%m-%d")
+            if date_str not in trends:
+                trends[date_str] = {"date": date_str, "total": 0, "verified": 0}
+            
+            trends[date_str]["total"] += 1
+            if r["status"] == "verified":
+                trends[date_str]["verified"] += 1
+        
+        # Sort by date
+        sorted_trends = sorted(trends.values(), key=lambda x: x["date"])
+        
+        return {
+            "success": True,
+            "trends": sorted_trends
+        }
+    except Exception as e:
+        logger.error(f"Analytics trends failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/analytics/export", tags=["Analytics"])
+async def export_reports_csv(
+    status: Optional[str] = None, 
+    violation_type: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None
+):
+    """
+    Export reports to CSV (Excel compatible)
+    """
+    try:
+        query = supabase_admin.table("reports").select("*")
+        if status and status != "all":
+            query = query.eq("status", status)
+        if violation_type and violation_type != "all":
+            query = query.eq("violation_type", violation_type)
+        if start_date:
+            query = query.gte("created_at", start_date)
+        if end_date:
+            query = query.lte("created_at", end_date)
+        
+        res = query.order("created_at", desc=True).execute()
+        reports = res.data
+
+        if not reports:
+            raise HTTPException(status_code=404, detail="No reports found matching criteria")
+
+        # Create CSV in memory with Excel-friendly formatting
+        output = io.StringIO()
+        
+        # Add UTF-8 BOM for Excel compatibility
+        output.write('\ufeff')
+        
+        writer = csv.DictWriter(output, fieldnames=reports[0].keys())
+        writer.writeheader()
+        
+        for r in reports:
+            row = r.copy()
+            for key, val in row.items():
+                if isinstance(val, (dict, list)):
+                    # Flatten nested objects for better Excel viewing
+                    import json
+                    row[key] = json.dumps(val)
+            writer.writerow(row)
+        
+        output.seek(0)
+        
+        filename = f"waonei_reports_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        
+        return StreamingResponse(
+            iter([output.getvalue()]),
+            media_type="text/csv",
+            headers={
+                "Content-Disposition": f"attachment; filename={filename}",
+                "Content-Type": "text/csv; charset=utf-8-sig"
+            }
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Analytics export failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/reports/search", tags=["Reports"])
+async def search_reports(
+    status: Optional[str] = None,
+    violation_type: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0
+):
+    """
+    Search reports with multiple filters and pagination
+    """
+    try:
+        limit = min(limit, 100)
+        
+        query = supabase_admin.table("reports").select("*", count="exact")
+        
+        if status and status != "all":
+            query = query.eq("status", status)
+        if violation_type and violation_type != "all":
+            query = query.eq("violation_type", violation_type)
+        if start_date:
+            query = query.gte("created_at", start_date)
+        if end_date:
+            query = query.lte("created_at", end_date)
+            
+        result = query.order("created_at", desc=True) \
+            .range(offset, offset + limit - 1) \
+            .execute()
+            
+        return {
+            "success": True,
+            "count": len(result.data),
+            "total_count": result.count,
+            "violations": result.data,
+            "pagination": {
+                "limit": limit,
+                "offset": offset,
+                "has_more": (offset + len(result.data)) < result.count if result.count is not None else False
+            }
+        }
+    except Exception as e:
+        logger.error(f"Report search failed: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
